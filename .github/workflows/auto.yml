@@ -2,43 +2,62 @@ name: Daily-News-ChatFlow
 
 on:
   schedule:
-    - cron: "0 16 * * *"   # 北京 00:00
+    - cron: "0 16 * * *"         # UTC 16:00 = 北京 00:00
   workflow_dispatch:
 
 jobs:
   news:
     runs-on: ubuntu-latest
+
     env:
-      BASE:  ${{ secrets.DIFY_BASE_URL }}
-      TOKEN: ${{ secrets.DIFY_APP_TOKEN }}
-      RSS:   ${{ secrets.RSS_LIST }}
+      BASE:  ${{ secrets.DIFY_BASE_URL }}     # 例 https://odos.zenpass.cn/api/v1
+      TOKEN: ${{ secrets.DIFY_APP_TOKEN }}    # 例 app_xxx...
+      RSS:   ${{ secrets.RSS_LIST }}          # 多行用\n分隔
       SERVERPUSHKEY: ${{ secrets.SERVERPUSHKEY }}
+
     steps:
       - name: Call Dify ChatFlow
         id: call
         shell: bash
         run: |
+          set -e
+
           echo ">> 生成请求体"
           jq -n --arg q "请抓取以下 RSS 并分类摘要：\n${RSS}" \
                 '{query:$q,inputs:{},response_mode:"blocking",conversation_id:"",user:"cron"}' \
                 > body.json
-          
+
           echo ">> 调用 /chat-messages"
           curl -sS -X POST "$BASE/chat-messages" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Content-Type: application/json" \
-            -d @body.json > resp.json
-          
-          ANSWER=$(jq -r '.answer' resp.json)
-          echo "::set-output name=digest::$ANSWER"
-          echo "NEWS_DIGEST<<EOF" >> $GITHUB_ENV
-          echo "$ANSWER"         >> $GITHUB_ENV
-          echo "EOF"             >> $GITHUB_ENV
+               -H "Authorization: Bearer $TOKEN" \
+               -H "Content-Type: application/json" \
+               -d @body.json \
+               -o resp.json \
+               -w "\nHTTP_CODE=%{http_code}\n"
+
+          echo "=== RAW (前 300 字) ==="
+          head -c 300 resp.json || true
+          echo -e "\n======================"
+
+          HTTP_CODE=$(grep -o 'HTTP_CODE=[0-9]*' resp.json | cut -d= -f2 || echo "000")
+          ANSWER=$(jq -er '.answer' resp.json 2>/dev/null || true)
+
+          # 将摘要写入输出（供后续步骤或通知）
+          echo "digest<<EOF" >> $GITHUB_OUTPUT
+          echo "$ANSWER"     >> $GITHUB_OUTPUT
+          echo "EOF"         >> $GITHUB_OUTPUT
+
+          # 如无摘要则报错，方便在 Actions UI 里直接看到红色失败
+          if [[ -z "$ANSWER" ]]; then
+            echo "❌ 未解析到 answer 字段，HTTP_CODE=$HTTP_CODE" >&2
+            exit 1
+          fi
 
       - name: Push via ServerChan
         if: env.SERVERPUSHKEY != ''
         shell: bash
         run: |
           TITLE="每日 RSS 摘要 $(date +%F)"
+          DIGEST="${{ steps.call.outputs.digest }}"
           curl -sS -X POST "https://sctapi.ftqq.com/${SERVERPUSHKEY}.send" \
-            -d "title=$TITLE&desp=${NEWS_DIGEST}"
+               -d "title=${TITLE}&desp=${DIGEST}"
